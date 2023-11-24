@@ -8,18 +8,21 @@ using System.Text.RegularExpressions;
 using System.Reflection.Metadata;
 using System.Globalization;
 using Microsoft.VisualBasic;
+using System.Security;
 
 namespace SQLBackupRetention
 {
     class Program
     {
-        private static readonly DateTime Now = DateTime.Now.Date.AddDays(1);
+        private static readonly DateTime Now = DateTime.Now.Date.AddDays(0);
         private static DateTime KeepAllCutoff = DateTime.Now;
         private static DateTime WeeksCutoff = DateTime.Now;
         private static DateTime MonthsCutoff = DateTime.Now;
         private static DateTime GlobalCutoff = DateTime.Now;
         private static string LogFileName = "";
-        private static ConfigData Config = new ConfigData();
+        private static GeneralConfig Config = new GeneralConfig();
+        private static List<BackedUpDatabases> backedUpDatabases = new List<BackedUpDatabases>();
+        private static BackedUpDatabases CurrentDatabase = new BackedUpDatabases();
         private static string ConnStFullBacups = "";
 
         static void Main(string[] args)
@@ -41,84 +44,58 @@ namespace SQLBackupRetention
 
             var tconfiguration = builder.Build();
 
-            Config = tconfiguration.Get<ConfigData>();
-            if (Config == null)
+            var tcg = tconfiguration.GetSection("General").Get<GeneralConfig>();
+
+            if (tcg == null)
             {
-                LogLine("ERROR: Missing configuration, or configuration file (appsettings.json) is invalid, aborting;");
+                LogLine("ERROR: Missing General configuration, or configuration file (appsettings.json) is invalid, aborting;");
                 return;
+            }
+            else
+            {
+                Config = tcg;
+            }
+
+            var tcb = tconfiguration.GetSection("BackedUpDatabases").Get<List<BackedUpDatabases>>();
+            if (tcb == null)
+            {
+                LogLine("ERROR: Missing \"BackedUpDatabases\" configuration section, or configuration file (appsettings.json) is invalid, aborting;");
+                return;
+            }
+            else
+            {
+                backedUpDatabases = tcb;
             }
             //things look OK we can log, so we can now wrap everything in a nice try catch
             try
             {
-                string ConfigValid = Config.CheckConfigIsValid();
-                if (ConfigValid != "")
+                Config.CheckConfigIsValid();
+                foreach (BackedUpDatabases bud in backedUpDatabases)
                 {
-                    LogLine(ConfigValid);
+                    bud.CheckConfigIsValid();
                 }
-
-                //compute cutoff vals
-                KeepAllCutoff = Now.AddDays(-Config.RetainAllInDays);
-                WeeksCutoff = KeepAllCutoff.AddDays(Config.WeeksRetention * -7);
-                MonthsCutoff = KeepAllCutoff.AddMonths(-Config.MonthsRetention);
-                GlobalCutoff = WeeksCutoff <= MonthsCutoff ? WeeksCutoff : MonthsCutoff;
                 if (Config.VerboseLogging)
                 {
                     LogLine();
-                    LogLine("Running with vals:");
-                    LogLine("Retain all files from the last N days: " + Config.RetainAllInDays);
-                    LogLine("Will retain all files from " + KeepAllCutoff.ToString("dd MMM yyyy") + " onwards");
-                    LogLine("Retain 1 '.bak' file per addittonal N weeks: " + Config.WeeksRetention);
-                    LogLine("Will retain 1 '.bak' file per week, from: " + WeeksCutoff.ToString("dd MMM yyyy"));
-                    LogLine("Retain 1 '.bak' file per addittonal N months: " + Config.MonthsRetention);
-                    LogLine("Will retain 1 '.bak' file per month, from: " + MonthsCutoff.ToString("dd MMM yyyy"));
-                    LogLine();
+                    LogLine("Running with vals (verbose):");
+                    LogLine("StorageURI: " + Config.StorageURI);
+                    LogLine("DoNotUseBlobTimestamps: " + Config.DoNotUseBlobTimestamps.ToString());
+                    LogLine("Running in \"simulation\" (AsIf) mode: " + Config.AsIf.ToString());
+                    LogLine("Number of databases to process: " + backedUpDatabases.Count.ToString());
                     LogLine();
                 }
-
+                else
+                {
+                    LogLine("Running with minimal logging. Number of databases to process: " + backedUpDatabases.Count.ToString());
+                }
                 ConnStFullBacups = "SharedAccessSignature=" + Config.SAS + ";BlobEndpoint=" + Config.StorageURI + ";";
-                BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, Config.FullBackupsContainer);
-                var blobs = containerFB.GetBlobs();
-                List<BlobFile> AllFiles = new List<BlobFile>();
-                foreach (BlobItem blob in blobs)
+                foreach (BackedUpDatabases bud in backedUpDatabases)
                 {
-                    if (blob.Name.TrimEnd().ToLower().EndsWith(".bak")
-                        || blob.Name.TrimEnd().ToLower().EndsWith(".trn"))
-                    {
-                        BlobFile t = new BlobFile(blob);
-                        AllFiles.Add(t);
-                    }
-                    else if (Config.VerboseLogging)
-                    {
-                        LogLine("Skipping file '" + blob.Name + "', does not end in '.bak' or '.trn'.");
-                    }
+                    DoOneDatabase(bud);
                 }
-                AllFiles.Sort();
-                if (Config.VerboseLogging)
-                {
-                    LogLine("All Files (sorted by date):");
-                    foreach (BlobFile file in AllFiles)
-                    {
-                        //LogLine(file.FileName + " (" + file.CreationTime.ToString("dd MMM yyyy") + ")");
-                    }
-                }
-                //now, let's find what needs deleting...
-                string[] DBs = Config.ListOfDatabaseNames.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                string[] stripedDBs = Config.ListOfDatabaseNames.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                foreach (string DB in DBs)
-                {
-                    List<BlobFile> ToDo = AllFiles.FindAll(f=> f.FileName.Trim().ToLower().StartsWith(DB.Trim().ToLower()));
-                    if (ToDo.Any())
-                    {
-                        if (Config.VerboseLogging) LogLine("Processing files for '" + DB.Trim().ToLower() + "' DB. N. of files is:" + ToDo.Count.ToString() + ".");
-                        else LogLine("Processing files for '" + DB.Trim().ToLower() + "'.");
-                        ProcessSingleDatabase(ToDo, stripedDBs.Contains(DB));
-                    } 
-                    else 
-                    {
-                        LogLine("No files found for '" + DB.Trim().ToLower() + "' DB.");
-                    }
-                }
-                
+                LogLine("Exiting without errors.");
+
+
             }
             catch (Exception ex)
             {
@@ -128,20 +105,118 @@ namespace SQLBackupRetention
             }
 
         }
+        private static void DoOneDatabase(BackedUpDatabases bud)
+        {
+            CurrentDatabase = bud;
+
+            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, bud.FullBackupsContainer);
+            var blobs = containerFB.GetBlobs();
+            List<BlobFile> AllFiles = new List<BlobFile>();
+            //we will get and consider only files with the expected shape of filename:
+            //starts with the name of the database, ends with ".bak" or ".trn"
+            //all case-insensitive
+            foreach (BlobItem blob in blobs)
+            {
+                string name = blob.Name.TrimEnd().ToLower();
+                if (name.StartsWith(bud.DatabaseName.ToLower())
+                    &&
+                    (name.EndsWith(".bak")
+                    || name.EndsWith(".trn"))
+                    )
+                {
+                    BlobFile t = new BlobFile(blob);
+                    AllFiles.Add(t);
+                }
+                else if (Config.VerboseLogging)
+                {
+                    LogLine("Skipping file '" + blob.Name + "'.");
+                }
+            }
+            AllFiles.Sort();
+            if (Config.VerboseLogging)
+            {
+                LogLine("All Files found (sorted by date):");
+                foreach (BlobFile file in AllFiles)
+                {
+                    LogLine(file.FileName + " (" + file.CreationTime.ToString("dd MMM yyyy") + ")");
+                }
+            }
+            //now, let's find what needs deleting...
+
+            List<BlobFile> ToDo = AllFiles.FindAll(f => f.FileName.Trim().ToLower().StartsWith(CurrentDatabase.DatabaseName.Trim().ToLower() + "_"));
+            if (ToDo.Any())
+            {
+                if (Config.VerboseLogging) LogLine("Processing files for '" + CurrentDatabase.DatabaseName.Trim().ToLower() + "'. N. of files is:" + ToDo.Count.ToString() + ".");
+                else LogLine("Processing files for '" + CurrentDatabase.DatabaseName.Trim().ToLower() + "'.");
+                ProcessSingleDatabase(ToDo, CurrentDatabase.IsStriped);
+            }
+            else
+            {
+                LogLine("No files found for '" + CurrentDatabase.DatabaseName.Trim().ToLower() + "' DB.");
+            }
+
+        }
+
         private static Regex Last1or2digitsInFilename = new Regex("\\d{1,2}", RegexOptions.RightToLeft);
         private static void ProcessSingleDatabase(List<BlobFile> AllFiles, bool isStriped = false)
         {
-            if (Config.VerboseLogging && isStriped) LogLine("Database is flagged as 'striped' (multiple '.bak' files per full backup).");
+            //compute cutoff vals
+            KeepAllCutoff = Now.AddDays(-CurrentDatabase.RetainAllInDays);
+            WeeksCutoff = KeepAllCutoff.AddDays(CurrentDatabase.WeeksRetention * -7);
+            MonthsCutoff = KeepAllCutoff.AddMonths(-CurrentDatabase.MonthsRetention);
+            GlobalCutoff = WeeksCutoff <= MonthsCutoff ? WeeksCutoff : MonthsCutoff;
+            if (Config.VerboseLogging)
+            {
+                LogLine();
+                LogLine("Running with vals:");
+                LogLine("Retain all files from the last N days: " + CurrentDatabase.RetainAllInDays);
+                LogLine("Will retain all files from " + KeepAllCutoff.ToString("dd MMM yyyy") + " onwards");
+                LogLine("Retain 1 '.bak' file per addittonal N weeks: " + CurrentDatabase.WeeksRetention);
+                LogLine("Will retain 1 '.bak' file per week, from: " + WeeksCutoff.ToString("dd MMM yyyy"));
+                LogLine("Retain 1 '.bak' file per addittonal N months: " + CurrentDatabase.MonthsRetention);
+                LogLine("Will retain 1 '.bak' file per month, from: " + MonthsCutoff.ToString("dd MMM yyyy"));
+                LogLine();
+            }
+            if (Config.VerboseLogging && isStriped) LogLine("Database is flagged as 'striped' (has multiple '.bak' files per full backup).");
+            
             List<BlobFile> FilesToDelete = new List<BlobFile>();
             List<BlobFile> WeekFilesToKeep = new List<BlobFile>();
             List<BlobFile> KeepAllFiles = new List<BlobFile>();
             List<BlobFile> MonthFilesToKeep = new List<BlobFile>();
-            DateTime NextKeepWeek = KeepAllCutoff;
-            DateTime NextKeepMonth = KeepAllCutoff;
-            bool currentMonthDone = false; int totMonthsDone = 0;
-            bool currentWeekDone = false; int totWeeksDone = 0;
-            FilesToDelete.AddRange(AllFiles.FindAll(f => f.CreationTime < KeepAllCutoff && f.FileName.EndsWith(".trn")));//not keeping and transaction files
-            FilesToDelete.AddRange(AllFiles.FindAll(f => f.CreationTime < GlobalCutoff));//not keeping files that are older than the smaller possible cutoff date
+
+            //let's calculate the intervals...
+            List<TimeInterval> WeeksTI = new List<TimeInterval>();
+            List<TimeInterval> MonthsTI = new List<TimeInterval>();
+            for (int i = 0; i < CurrentDatabase.WeeksRetention; i++)
+            {
+                WeeksTI.Add(new TimeInterval()
+                {
+                    End = KeepAllCutoff.AddDays(i * -7),
+                    Start = KeepAllCutoff.AddDays((i + 1) * -7)
+                });
+            }
+            for (int i = 0; i < CurrentDatabase.MonthsRetention; i++)
+            {
+                MonthsTI.Add(new TimeInterval()
+                {
+                    End = KeepAllCutoff.AddMonths(-i),
+                    Start = KeepAllCutoff.AddMonths(-(i + 1))
+                });
+            }
+            if (Config.VerboseLogging)
+            {
+                LogLine("Weekly timespans for retaining one backup set:");
+                foreach (TimeInterval ti in WeeksTI) LogLine("From " + ti.Start.ToString("dd MMM yyyy") 
+                    + " included, to " + ti.End.ToString("dd MMM yyyy") + " excluded");
+                LogLine("Monthly timespans for retaining one backup set:");
+                foreach (TimeInterval ti in MonthsTI) LogLine("From " + ti.Start.ToString("dd MMM yyyy")
+                    + " included, to " + ti.End.ToString("dd MMM yyyy") + " excluded");
+            }
+            //we don't keep transaction files outside the "keep all" period
+            FilesToDelete.AddRange(AllFiles.FindAll(f => f.CreationTime < KeepAllCutoff && f.FileName.EndsWith(".trn")));
+            //not keeping files that are older than the smaller possible cutoff date
+            FilesToDelete.AddRange(AllFiles.FindAll(f => f.CreationTime < GlobalCutoff));
+
             foreach (BlobFile file in FilesToDelete)
             {
                 AllFiles.Remove(file);
@@ -151,152 +226,135 @@ namespace SQLBackupRetention
             {
                 AllFiles.Remove(file);
             }
-            for (int i = AllFiles.Count - 1; i >= 0; i--)
-            {//from newer file to older, only files not in the "keep all range"
-                BlobFile t = AllFiles[i];
-                //considering the Weekly files only
-                if (t.CreationTime >= NextKeepWeek)
+            //we've removed all files that are older than our overall retention, or inside the "keep all"
+            //we now need to put files inside our TimeInterval objects, for week and months
+            foreach(TimeInterval ti in WeeksTI)
+            {
+                List<BlobFile> eligible = AllFiles.FindAll(f => f.CreationTime < ti.End && f.CreationTime >= ti.Start);
+                //foreach (BlobFile b in eligible) Console.WriteLine("From " + ti.Start.ToString("dd MMM yyyy")
+                //    + " included, to " + ti.End.ToString("dd MMM yyyy") + " excluded " + b.FileName);
+                if (eligible.Any())
                 {
-                    if (currentWeekDone)
+                    BlobFile oneToAdd = eligible.Last();//the last eligible is the newest file in the interval
+                    ti.BlobsToKeep.Add(oneToAdd);
+                    eligible.Remove(oneToAdd);
+                    if (CurrentDatabase.IsStriped)
                     {
-                        if (!FilesToDelete.Contains(t) && !KeepAllFiles.Contains(t)
-                            && !WeekFilesToKeep.Contains(t) && !MonthFilesToKeep.Contains(t)) FilesToDelete.Add(t);
-                    }
-                    else
-                    {
-                        currentWeekDone = true;
-                        if (t.CreationTime >= WeeksCutoff && t.CreationTime >= GlobalCutoff)
+                        //we'll try to find all stripes at this point...
+                        Match match = Last1or2digitsInFilename.Match(oneToAdd.FileName);
+                        if (match.Success)
                         {
-                            if (isStriped == false) WeekFilesToKeep.Add(t);
-                            else
-                            {//we'll try to find all stripes at this point...
-                                List<BlobFile> stripes = new List<BlobFile>();
-                                stripes.Add(t);
-                                Match match = Last1or2digitsInFilename.Match(t.FileName);
-                                if (match.Success)
+                            string ConstantPartOfFilename = oneToAdd.FileName.Substring(0, match.Index);
+                            List<BlobFile> matching = eligible.FindAll(f => f.FileName.StartsWith(ConstantPartOfFilename)
+                                && f.CreationTime == oneToAdd.CreationTime);
+                            foreach (BlobFile file in matching)
+                            {
+                                if (!ti.BlobsToKeep.Contains(file))
                                 {
-                                    string ConstantPartOfFilename = t.FileName.Substring(0, match.Index);
-                                    List<BlobFile> matching = AllFiles.FindAll(f=> f.FileName.StartsWith(ConstantPartOfFilename)
-                                        && f.CreationTime == t.CreationTime);
-                                    foreach (BlobFile file in matching)
-                                    {
-                                        if (!stripes.Contains(file) && !WeekFilesToKeep.Contains(file))
-                                        {
-                                            stripes.Add(file);
-                                            AllFiles.Remove(file);
-                                            i--;//we found the first file in a series of stripes and we're removing a subsequent stripe file, making out i too big by one, so we correct it
-                                        }
-                                    }
+                                    ti.BlobsToKeep.Add(file);
                                 }
-
-                                WeekFilesToKeep.AddRange(stripes);
                             }
                         }
-                        else if (!FilesToDelete.Contains(t) && !KeepAllFiles.Contains(t)
-                            && !WeekFilesToKeep.Contains(t) && !MonthFilesToKeep.Contains(t)) FilesToDelete.Add(t);
                     }
+                    WeekFilesToKeep.AddRange(ti.BlobsToKeep);
                 }
-                else
-                {//we slipped in the next week!
-                    if (totWeeksDone < Config.WeeksRetention)
-                    {//we want to add more weekly files
-                        totWeeksDone++;
-                        currentWeekDone = false;
-                        NextKeepWeek = NextKeepWeek.AddDays(-7);
-                        i++;//We do this same file again, will match previous cases
-                        continue;
-                    }
-                }
-                //now the monthly files...
-                if (t.CreationTime >= NextKeepMonth)
-                {
-                    if (currentMonthDone)
-                    {
-                        if (!FilesToDelete.Contains(t) && !KeepAllFiles.Contains(t)
-                            && !WeekFilesToKeep.Contains(t) && !MonthFilesToKeep.Contains(t)) FilesToDelete.Add(t);
-                    }
-                    else
-                    {
-                        currentMonthDone = true;
-                        if (t.CreationTime >= MonthsCutoff && t.CreationTime >= GlobalCutoff)
-                        {
-                            if (isStriped == false) MonthFilesToKeep.Add(t);
-                            else
-                            {//we'll try to find all stripes at this point...
-                                List<BlobFile> stripes = new List<BlobFile>();
-                                stripes.Add(t);
-                                Match match = Last1or2digitsInFilename.Match(t.FileName);
-                                if (match.Success)
-                                {
-                                    string ConstantPartOfFilename = t.FileName.Substring(0, match.Index);
-                                    List<BlobFile> matching = AllFiles.FindAll(f => f.FileName.StartsWith(ConstantPartOfFilename)
-                                         && f.CreationTime == t.CreationTime);
-                                    foreach (BlobFile file in matching)
-                                    {
-                                        if (!stripes.Contains(file) && !MonthFilesToKeep.Contains(file))
-                                        {
-                                            stripes.Add(file);
-                                            AllFiles.Remove(file);
-                                            i--;//we found the first file in a series of stripes and we're removing a subsequent stripe file, making out i too big by one, so we correct it
-                                        }
-                                    }
-                                }
-                                MonthFilesToKeep.AddRange(stripes);
-                            }
-                        }
-                        else if (!FilesToDelete.Contains(t) && !KeepAllFiles.Contains(t)
-                            && !WeekFilesToKeep.Contains(t) && !MonthFilesToKeep.Contains(t)) FilesToDelete.Add(t);
-                    }
-                }
-                else if (totMonthsDone < Config.MonthsRetention)
-                {//we want to add more monthly files
-                    currentMonthDone = false;
-                    totMonthsDone++;
-                    NextKeepMonth = NextKeepMonth.AddMonths(-1);
-                    i++;//We do this same file again, will match previous cases
-                    continue;
-                }
-                else if (!FilesToDelete.Contains(t) && !KeepAllFiles.Contains(t)
-                    && !WeekFilesToKeep.Contains(t) && !MonthFilesToKeep.Contains(t)) FilesToDelete.Add(t);
-
             }
+            //and again, for months
+            foreach (TimeInterval ti in MonthsTI)
+            {
+                List<BlobFile> eligible = AllFiles.FindAll(f => f.CreationTime < ti.End && f.CreationTime >= ti.Start);
+                //foreach (BlobFile b in eligible) Console.WriteLine("From " + ti.Start.ToString("dd MMM yyyy")
+                //    + " included, to " + ti.End.ToString("dd MMM yyyy") + " excluded " + b.FileName);
+                if (eligible.Any())
+                {
+                    BlobFile oneToAdd = eligible.Last();//the last eligible is the newest file in the interval
+                    ti.BlobsToKeep.Add(oneToAdd);
+                    eligible.Remove(oneToAdd);
+                    if (CurrentDatabase.IsStriped)
+                    {
+                        //we'll try to find all stripes at this point...
+                        Match match = Last1or2digitsInFilename.Match(oneToAdd.FileName);
+                        if (match.Success)
+                        {
+                            string ConstantPartOfFilename = oneToAdd.FileName.Substring(0, match.Index);
+                            List<BlobFile> matching = eligible.FindAll(f => f.FileName.StartsWith(ConstantPartOfFilename)
+                                && f.CreationTime == oneToAdd.CreationTime);
+                            foreach (BlobFile file in matching)
+                            {
+                                if (!ti.BlobsToKeep.Contains(file))
+                                {
+                                    ti.BlobsToKeep.Add(file);
+                                }
+                            }
+                        }
+                    }
+                    MonthFilesToKeep.AddRange(ti.BlobsToKeep);
+                }
+            }
+            //finally, deal with leftovers - there may still be files in "AllFiles"
+            //but our lists of files to keep are now done, so whatever isn't in there, needs to move to the list for deletion
+            for (int i = 0; i < AllFiles.Count; i++)
+            {
+                BlobFile file = AllFiles[i];
+                if (!KeepAllFiles.Contains(file)
+                    &&!WeekFilesToKeep.Contains(file)
+                    &&!MonthFilesToKeep.Contains(file)) 
+                {
+                    AllFiles.Remove(file);
+                    FilesToDelete.Add(file);
+                    i--;
+                }
+            }
+
+            //that's basically all done.
+            //we have 4 lists: "to delete", "in the keep all range", "in weekly sets", in "monthly sets"
+            //we can "just" delete what's in the former, but to be extra sure, we'll check that no file to delete is in the "to keep" ranges.
+            foreach (BlobFile file in FilesToDelete)
+            {
+                if (KeepAllFiles.Contains(file)) throw new Exception("Bug alert! A file marked for deletion is also in the \"Keep all\" range. Aborting.");
+                else if (WeekFilesToKeep.Contains(file)) throw new Exception("Bug alert! A file marked for deletion is also in one of the \"Weekly\" sets. Aborting.");
+                else if (MonthFilesToKeep.Contains(file)) throw new Exception("Bug alert! A file marked for deletion is also in one of the \"Monthly\" sets. Aborting.");
+            }
+
+            LogLine("Summary for \"" + CurrentDatabase.DatabaseName + "\":");
             if (Config.VerboseLogging)
             {
                 if (Config.AsIf == true) LogLine("AsIf flag is 'true', running in simulation mode - WILL NOT DELETE ANYTHING!");
                 if (Config.AsIf == false) LogLine("Deleting (" + FilesToDelete.Count.ToString() + "):");
                 else LogLine("Would delete (" + FilesToDelete.Count.ToString() + "):");
-                foreach (BlobFile file in FilesToDelete) LogLine(file.FileName);
+                foreach (BlobFile file in FilesToDelete) LogLine(file.FileName + " - " + file.CreationTime.ToString("dd MMM yyyy"));
                 LogLine();
                 if (Config.AsIf == false) LogLine("Files kept in the \"Keep All\" range (" + KeepAllFiles.Count.ToString() + ") :");
                 else LogLine("Files that would be kept in the \"Keep All\" range (" + KeepAllFiles.Count.ToString() + ") :");
-                foreach (BlobFile file in KeepAllFiles) LogLine(file.FileName);
+                foreach (BlobFile file in KeepAllFiles) LogLine(file.FileName + " - " + file.CreationTime.ToString("dd MMM yyyy"));
                 LogLine();
                 if (Config.AsIf == false) LogLine("Weekly files kept (" + WeekFilesToKeep.Count.ToString() + "):");
                 else LogLine("Weekly files that would be kept (" + WeekFilesToKeep.Count.ToString() + "):");
-                foreach (BlobFile file in WeekFilesToKeep) LogLine(file.FileName);
+                foreach (BlobFile file in WeekFilesToKeep) LogLine(file.FileName + " - " + file.CreationTime.ToString("dd MMM yyyy"));
                 LogLine();
                 if (Config.AsIf == false) LogLine("Monthly files kept (" + MonthFilesToKeep.Count.ToString() + "):");
                 else LogLine("Monthly files that would be kept (" + MonthFilesToKeep.Count.ToString() + "):");
-                foreach (BlobFile file in MonthFilesToKeep) LogLine(file.FileName);
+                foreach (BlobFile file in MonthFilesToKeep) LogLine(file.FileName + " - " + file.CreationTime.ToString("dd MMM yyyy"));
                 LogLine();
-            } 
+            }
             else
             {
                 if (Config.AsIf == false) LogLine("Deleting: " + FilesToDelete.Count.ToString() + " files.");
                 else LogLine("Running in 'As if' mode, would otherwise delete: " + FilesToDelete.Count.ToString() + " files.");
             }
+
             if (Config.AsIf == false) DeleteTheseFiles(FilesToDelete);
         }
         private static void DeleteTheseFiles(List<BlobFile> FilesToDelete)
         {
-            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, Config.FullBackupsContainer);
+            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, CurrentDatabase.FullBackupsContainer);
 
             foreach (BlobFile file in FilesToDelete)
             {
                 try
                 {
                     containerFB.GetBlobClient(file.FileName).DeleteIfExists();
-                } 
+                }
                 catch (Exception e)
                 {
                     LogException(e, "Failed to delete file: " + file.FileName + ". Will try deleting the remaining files.");
@@ -315,6 +373,8 @@ namespace SQLBackupRetention
                 }
             }
             LogFileName = tLogFilename;
+            LogLine();
+            LogLine("----------------------------------");
             LogLine("Starting SQLBackupRetention app...");
             LogLine();
         }
@@ -328,7 +388,7 @@ namespace SQLBackupRetention
             if (ex.InnerException != null)
             {
                 LogLine("Inner Exception(s): ");
-                Exception ie = ex.InnerException;
+                Exception? ie = ex.InnerException;
                 int i = 0;
                 while (ie != null && i < 10)
                 {
@@ -342,17 +402,17 @@ namespace SQLBackupRetention
             }
             LogLine();
         }
-        
+
         private static void LogLine(string Line = "")
         {
             try
             {
-                using (StreamWriter f = new StreamWriter(LogFileName))
+                using (StreamWriter f = new FileInfo(LogFileName).AppendText())
                 {
                     Console.WriteLine(Line);
                     f.WriteLine(Line);
                 }
-            } 
+            }
             catch
             {
                 //do nothing, can't log failures to log!
@@ -360,7 +420,7 @@ namespace SQLBackupRetention
         }
         //2023_11_22
         private static Regex FindTimeStampRx = new Regex("_\\d\\d\\d\\d_\\d\\d_\\d\\d_");
-        private class BlobFile : IComparable<BlobFile> 
+        private class BlobFile : IComparable<BlobFile>
         {
             public int CompareTo(BlobFile? other)
             {
@@ -385,137 +445,63 @@ namespace SQLBackupRetention
                 if (tmp == DateTime.MinValue && Config.DoNotUseBlobTimestamps == false)
                 {//we'll use the blob timestamp
                     if (blob.Properties.CreatedOn != null)
-                        CreationTime =  blob.Properties.CreatedOn.Value.DateTime;
+                        CreationTime = blob.Properties.CreatedOn.Value.DateTime;
                     // nothing else, if we can't find the timestamp of a file, we'll let it be - already has a date in the future...
                 }
             }
         }
-        private class ConfigData
+        private class GeneralConfig
         {
-            private string _StorageURI = ""; 
-            private string _SAS = "";
-            private string _FullBackupsContainer = "";
-            private string _TransactionLogsContainer = "";
-            private string _ListOfDatabaseNames = "";
-            private string _ListOfStripedDatabases = "";
-            private int _RetainAllInDays = -1;
-            private int _WeeksRetention = -1; 
-            private int _MonthsRetention = -1;
-            private bool _AsIf = true;
-            private bool _AsIfImplicit = true;
-            public string StorageURI { 
-                get { return _StorageURI; }
-                set 
-                {
-                    _StorageURI = value;
-                } 
-            }
-            public string SAS
-            {
-                get { return _SAS; }
-                set
-                {
-                    _SAS = value;
-                }
-            }
-            public string FullBackupsContainer
-            {
-                get { return _FullBackupsContainer; }
-                set
-                {
-                    
-                    _FullBackupsContainer = value;
-                }
-            }
-            public string TransactionLogsContainer
-            {
-                get { return _TransactionLogsContainer; }
-                set
-                {
-                    _TransactionLogsContainer = value;
-                }
-            }
-            public string ListOfDatabaseNames
-            {
-                get { return _ListOfDatabaseNames; }
-                set
-                {
-                    _ListOfDatabaseNames = value.Trim().ToLower();
-                }
-            }
-            public string ListOfStripedDatabases
-            {
-                get { return _ListOfStripedDatabases; }
-                set { _ListOfStripedDatabases=value.Trim().ToLower(); }
-            }
-            public int RetainAllInDays
-            {
-                get { return _RetainAllInDays; }
-                set
-                {
-                    _RetainAllInDays = value;
-                }
-            }
-            public int WeeksRetention
-            {
-                get { return _WeeksRetention; }
-                set
-                {
-                    _WeeksRetention = value;
-                }
-            }
-            public int MonthsRetention
-            {
-                get { return _MonthsRetention; }
-                set
-                {
-                     _MonthsRetention = value;
-                }
-            }
-            public bool AsIf
-            {
-                get { return _AsIf; }
-                set
-                {
-                    _AsIfImplicit = false;
-                    _AsIf = value;
-                }
-            }
-            public bool DoNotUseBlobTimestamps { get; set; } = true;
+            public string StorageURI { get; set; } = "";
+            public string SAS { get; set; } = "";
             public bool VerboseLogging { get; set; } = true;
-            public string CheckConfigIsValid()
+            public bool DoNotUseBlobTimestamps { get; set; } = true;
+            public bool AsIf { get; set; } = true;
+
+            public void CheckConfigIsValid()
             {
-                if (_ListOfDatabaseNames == "") 
-                    throw new ArgumentNullException("ListOfDatabaseNames configuration value is not valid, needs to be present! (please use a comma-separated list of names for multiple DBs)");
-                else if(!StorageURI.StartsWith("https://")) 
-                    throw new ArgumentNullException("StorageURI configuration value is not valid, needs to be present and to start with \"https://\"");
-                else if (FullBackupsContainer.Length < 1)
-                    throw new ArgumentNullException("FullBackupsContainer configuration value is not valid, needs to be present.");
-                else if (TransactionLogsContainer.Length < 1)
-                    throw new ArgumentNullException("TransactionLogsContainer configuration value is not valid, needs to be present.");
-                else if (RetainAllInDays < 0)
-                    throw new ArgumentNullException("RetainAllInDays configuration value is not valid, needs to be present and to be an integer with value >= 0.");
-                else if (WeeksRetention  < 0)
-                    throw new ArgumentNullException("WeeksRetention configuration value is not valid, needs to be present and to be an integer with value >= 0.");
-                else if (MonthsRetention < 0)
-                    throw new ArgumentNullException("MonthsRetention configuration value is not valid, needs to be present and to be an integer with value >= 0.");
-                else if (_AsIfImplicit)
-                {
-                    return "AsIf setting was not explicitly set, therefore app is running with AsIf=true, to avoid accidental deletions.";
-                }
-                //we'll check the list of striped DBs if present...
-                if (_ListOfStripedDatabases != "" )
-                {
-                    string[] DBs = _ListOfDatabaseNames.Split(",", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                    string[] stripedDBs = _ListOfStripedDatabases.Split(",", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                    foreach(string striped in stripedDBs)
-                    {
-                        if (!DBs.Contains(striped))
-                            throw new Exception("ListOfStripedDatabases configuration value is not valid, needs to include ONLY names mentioned in ListOfDatabaseNames.");
-                    }
-                }
-                return "";
+                if (!StorageURI.StartsWith("https://"))
+                    throw new InvalidDataException("StorageURI configuration value is not valid, needs to be present and to start with \"https://\"");
+                else if (SAS == "" || !SAS.StartsWith("sv="))
+                    throw new InvalidDataException("SAS configuration value is not valid, it is either absent or invalid.");
             }
+        }
+        private class BackedUpDatabases
+        {
+            public string FullBackupsContainer { get; set; } = "";
+            //public string TransactionLogsContainer { get; set; } = "";
+            public string DatabaseName { get; set; } = "";
+            public bool IsStriped { get; set; } = true;
+            public int RetainAllInDays { get; set; } = -1;
+            public int WeeksRetention { get; set; } = -1;
+            public int MonthsRetention { get; set; } = -1;
+            public void CheckConfigIsValid()
+            {
+                if (FullBackupsContainer == "")
+                    throw new InvalidDataException("A FullBackupsContainer configuration value is not valid, needs to be present.");
+                //else if (TransactionLogsContainer == "")
+                //    throw new InvalidDataException("A TransactionLogsContainer configuration value is not valid, needs to be present.");
+                else if (DatabaseName == "")
+                    throw new InvalidDataException("A DatabaseName configuration value is not valid, needs to be present.");
+                else if (RetainAllInDays < 0)
+                    throw new InvalidDataException("RetainAllInDays configuration value for Database \""
+                        + DatabaseName + "\" is not valid, needs to be a positive integer (including zero).");
+                else if (WeeksRetention < 0)
+                    throw new InvalidDataException("WeeksRetention configuration value for Database \""
+                        + DatabaseName + "\" is not valid, needs to be a positive integer (including zero).");
+                else if (MonthsRetention < 0)
+                    throw new InvalidDataException("MonthsRetention configuration value for Database \""
+                        + DatabaseName + "\" is not valid, needs to be a positive integer (including zero).");
+            }
+
+        }
+
+        private class TimeInterval
+        {
+            public DateTime Start { get; set; } = DateTime.MinValue;
+            public DateTime End { get; set; } = DateTime.MinValue;
+            public List<BlobFile> BlobsToKeep { get; set; } = new List<BlobFile>();
+            public bool HasFiles { get { return BlobsToKeep.Count > 0; } }
         }
     }
 }
