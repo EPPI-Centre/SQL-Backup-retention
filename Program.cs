@@ -77,7 +77,7 @@ namespace SQLBackupRetention
                 if (Config.VerboseLogging)
                 {
                     LogLine();
-                    LogLine("Running with vals (verbose):");
+                    LogLine("Running with values (verbose):");
                     LogLine("StorageURI: " + Config.StorageURI);
                     LogLine("DoNotUseBlobTimestamps: " + Config.DoNotUseBlobTimestamps.ToString());
                     LogLine("Running in \"simulation\" (AsIf) mode: " + Config.AsIf.ToString());
@@ -108,8 +108,10 @@ namespace SQLBackupRetention
         private static void DoOneDatabase(BackedUpDatabases bud)
         {
             CurrentDatabase = bud;
-
-            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, bud.FullBackupsContainer);
+            LogLine();
+            LogLine("Processing folder: '" + Config.StorageURI + bud.BackupsContainer 
+                + "'. Looking for backup files of database '" + bud.DatabaseName + "'.");
+            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, bud.BackupsContainer.ToLower());
             var blobs = containerFB.GetBlobs();
             List<BlobFile> AllFiles = new List<BlobFile>();
             //we will get and consider only files with the expected shape of filename:
@@ -168,12 +170,12 @@ namespace SQLBackupRetention
             if (Config.VerboseLogging)
             {
                 LogLine();
-                LogLine("Running with vals:");
+                LogLine("Running with values:");
                 LogLine("Retain all files from the last N days: " + CurrentDatabase.RetainAllInDays);
                 LogLine("Will retain all files from " + KeepAllCutoff.ToString("dd MMM yyyy") + " onwards");
-                LogLine("Retain 1 '.bak' file per addittonal N weeks: " + CurrentDatabase.WeeksRetention);
+                LogLine("Retain 1 '.bak' file per additional N weeks: " + CurrentDatabase.WeeksRetention);
                 LogLine("Will retain 1 '.bak' file per week, from: " + WeeksCutoff.ToString("dd MMM yyyy"));
-                LogLine("Retain 1 '.bak' file per addittonal N months: " + CurrentDatabase.MonthsRetention);
+                LogLine("Retain 1 '.bak' file per additional N months: " + CurrentDatabase.MonthsRetention);
                 LogLine("Will retain 1 '.bak' file per month, from: " + MonthsCutoff.ToString("dd MMM yyyy"));
                 LogLine();
             }
@@ -347,7 +349,7 @@ namespace SQLBackupRetention
         }
         private static void DeleteTheseFiles(List<BlobFile> FilesToDelete)
         {
-            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, CurrentDatabase.FullBackupsContainer);
+            BlobContainerClient containerFB = new BlobContainerClient(ConnStFullBacups, CurrentDatabase.BackupsContainer.ToLower());
 
             foreach (BlobFile file in FilesToDelete)
             {
@@ -468,7 +470,7 @@ namespace SQLBackupRetention
         }
         private class BackedUpDatabases
         {
-            public string FullBackupsContainer { get; set; } = "";
+            public string BackupsContainer { get; set; } = "";
             //public string TransactionLogsContainer { get; set; } = "";
             public string DatabaseName { get; set; } = "";
             public bool IsStriped { get; set; } = true;
@@ -477,8 +479,10 @@ namespace SQLBackupRetention
             public int MonthsRetention { get; set; } = -1;
             public void CheckConfigIsValid()
             {
-                if (FullBackupsContainer == "")
-                    throw new InvalidDataException("A FullBackupsContainer configuration value is not valid, needs to be present.");
+                BackupsContainer = BackupsContainer.ToLower();
+                DatabaseName = DatabaseName.ToLower();
+                if (BackupsContainer == "")
+                    throw new InvalidDataException("A BackupsContainer configuration value is not valid, needs to be present.");
                 //else if (TransactionLogsContainer == "")
                 //    throw new InvalidDataException("A TransactionLogsContainer configuration value is not valid, needs to be present.");
                 else if (DatabaseName == "")

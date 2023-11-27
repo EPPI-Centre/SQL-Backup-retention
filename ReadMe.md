@@ -43,7 +43,7 @@ To function properly, the utility needs to write to a log file, thus you will ne
 These are divided in two parts `General` and `BackedUpDatabases`.
 
 **General:**
-- `StorageURI` [Required] - this contains the https address of your blob storage account, as in `https://[storage_account_name].blob.core.windows.net/`
+- `StorageURI` [Required] - this contains the https address of your blob storage account, as in `https://[storage_account_name].blob.core.windows.net/` (please **note the ending forward slash**, which is required)
 - `SAS` [Required] - the URL-encoded Shared Access Signature (SAS) that provides access to said storage account.
 - `VerboseLogging` **Default value is `true`.** - If true, the app will log to file (and console) every single thing it does, and then some. Otherwise it will log far less details, but never nothing.
 - `DoNotUseBlobTimestamps` **Default value is `true`.** - See below, this is a risky option (if set to `false`) which allows to use the timestamp of the blob files to decide what to keep and what to delete. Might produce unexpected results, as the blob timestamps refer to the blob files themselves, but the backup files might be older (have been generated elsewhere, and uploaded to the cloud later). 
@@ -51,7 +51,7 @@ These are divided in two parts `General` and `BackedUpDatabases`.
 
 **BackedUpDatabases** is a JSON array of objects, each defining the retention policy for a single database. Elements for each database are:
 
-- - `FullBackupsContainer` [Required]: the name of the blob container where your backups are stored.
+- - `BackupsContainer` [Required]: the name of the blob container where your backups are stored. 
 - `DatabaseName`: "reviewer" [Required, case-insensitive]: the name of the database covered by this "policy".
 - `IsStriped` [Boolean, defaults to `false`]: if set to `true` the app will expect that 1 backup set is comprised by multiple numbered files, where their "number" is the last number appearing in the filename, like in: `DBName_backup_2023_11_24_stripe1.bak`, `DBName_backup_2023_11_24_stripe2.bak`, [...]. 
     - App can work for up to 100 stripes, as it will recognise filenames that use both `stripe01` and `stripe1` convention. Note that the only requirment is that the numbers which change need to be _the last numbers that change_ (from within a single backup set) the filename doesn't need to contain the word "stripe" or anything. On the other hand, if the filenames contain a very detailed timestamp, to the point where `[long name with date-time]file1.bak` might have a different "date-time" to the last stripe in the set `[long name with later date-time]file25.bak`. This utility **does not** read the file headers, and considers **only** filenames for identifying stripes.
