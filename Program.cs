@@ -9,6 +9,7 @@ using System.Reflection.Metadata;
 using System.Globalization;
 using Microsoft.VisualBasic;
 using System.Security;
+using System.Net.Mail;
 
 namespace SQLBackupRetention
 {
@@ -24,19 +25,10 @@ namespace SQLBackupRetention
         private static List<BackedUpDatabases> backedUpDatabases = new List<BackedUpDatabases>();
         private static BackedUpDatabases CurrentDatabase = new BackedUpDatabases();
         private static string ConnStFullBacups = "";
+        private static bool ContinuedOnError = false;
 
         static void Main(string[] args)
         {
-            try
-            {
-                MakeLogFile();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("ERROR creating log file, will abort. Error message is below.");
-                Console.WriteLine(ex.ToString());
-                return;
-            }
             var builder = new ConfigurationBuilder()
                 .SetBasePath(Directory.GetCurrentDirectory())
                 .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -48,7 +40,8 @@ namespace SQLBackupRetention
 
             if (tcg == null)
             {
-                LogLine("ERROR: Missing General configuration, or configuration file (appsettings.json) is invalid, aborting;");
+                if (MakeLogFile()) 
+                    LogLine("ERROR: Missing General configuration, or configuration file (appsettings.json) is invalid, aborting;");
                 return;
             }
             else
@@ -57,16 +50,23 @@ namespace SQLBackupRetention
             }
 
             var tcb = tconfiguration.GetSection("BackedUpDatabases").Get<List<BackedUpDatabases>>();
-            if (tcb == null)
+            if (tcb == null || tcb.Count == 0)
             {
-                LogLine("ERROR: Missing \"BackedUpDatabases\" configuration section, or configuration file (appsettings.json) is invalid, aborting;");
+                if (MakeLogFile()) LogLine("ERROR: Missing \"BackedUpDatabases\" configuration section, or configuration file (appsettings.json) is invalid, aborting.");
                 return;
             }
             else
             {
                 backedUpDatabases = tcb;
             }
-            //things look OK we can log, so we can now wrap everything in a nice try catch
+            //can't do much without being able to log actions takes, so we abort if making/opening the log file fails
+            //errors are handled within, MakeLogFile() will attempt to send an email if such settings are provided and pass validation.
+            if (!MakeLogFile())
+            {
+                return;
+            }
+            
+            //things look OK: we can log, so we can now wrap everything in a nice try catch
             try
             {
                 Config.CheckConfigIsValid();
@@ -77,7 +77,7 @@ namespace SQLBackupRetention
                 if (Config.VerboseLogging)
                 {
                     LogLine();
-                    LogLine("Running with values (verbose):");
+                    LogLine("Running with settings (verbose):");
                     LogLine("StorageURI: " + Config.StorageURI);
                     LogLine("DoNotUseBlobTimestamps: " + Config.DoNotUseBlobTimestamps.ToString());
                     LogLine("Running in \"simulation\" (AsIf) mode: " + Config.AsIf.ToString());
@@ -95,12 +95,20 @@ namespace SQLBackupRetention
                 }
                 LogLine("Exiting without errors.");
 
+                if (Config.EmailIsEnabled || (Config.EmailMode.ToLower() == "always" || ContinuedOnError))
+                {//if we have instructions for sending emails and either we did get some error (on deleting files) or we're asking to always send emails,
+                    //then we send the email!
+
+                    //read the whole log-file and send it
+                    SendLogFileViaEmail();
+                }
 
             }
             catch (Exception ex)
             {
                 LogException(ex);
                 LogLine("Error encountered, aborting.");
+                SendLogFileViaEmail();
                 return;
             }
 
@@ -156,7 +164,6 @@ namespace SQLBackupRetention
             {
                 LogLine("No files found for '" + CurrentDatabase.DatabaseName.Trim().ToLower() + "' DB.");
             }
-
         }
 
         private static Regex Last1or2digitsInFilename = new Regex("\\d{1,2}", RegexOptions.RightToLeft);
@@ -170,13 +177,13 @@ namespace SQLBackupRetention
             if (Config.VerboseLogging)
             {
                 LogLine();
-                LogLine("Running with values:");
+                LogLine("Running with settings:");
                 LogLine("Retain all files from the last N days: " + CurrentDatabase.RetainAllInDays);
                 LogLine("Will retain all files from " + KeepAllCutoff.ToString("dd MMM yyyy") + " onwards");
-                LogLine("Retain 1 '.bak' file per additional N weeks: " + CurrentDatabase.WeeksRetention);
-                LogLine("Will retain 1 '.bak' file per week, from: " + WeeksCutoff.ToString("dd MMM yyyy"));
-                LogLine("Retain 1 '.bak' file per additional N months: " + CurrentDatabase.MonthsRetention);
-                LogLine("Will retain 1 '.bak' file per month, from: " + MonthsCutoff.ToString("dd MMM yyyy"));
+                LogLine("Retain 1 '.bak' file/set per additional N weeks: " + CurrentDatabase.WeeksRetention);
+                LogLine("Will retain 1 '.bak' file/set per week, from: " + WeeksCutoff.ToString("dd MMM yyyy"));
+                LogLine("Retain 1 '.bak' file/set per additional N months: " + CurrentDatabase.MonthsRetention);
+                LogLine("Will retain 1 '.bak' file/set per month, from: " + MonthsCutoff.ToString("dd MMM yyyy"));
                 LogLine();
             }
             if (Config.VerboseLogging && isStriped) LogLine("Database is flagged as 'striped' (has multiple '.bak' files per full backup).");
@@ -359,26 +366,45 @@ namespace SQLBackupRetention
                 }
                 catch (Exception e)
                 {
+                    ContinuedOnError = true;
                     LogException(e, "Failed to delete file: " + file.FileName + ". Will try deleting the remaining files.");
                 }
             }
         }
-        private static void MakeLogFile()
+        private static bool MakeLogFile()
         {
-            DirectoryInfo logDir = System.IO.Directory.CreateDirectory("LogFiles");
-            string tLogFilename = logDir.FullName + @"\" + "SQLBackupRetention-" + DateTime.Now.ToString("dd-MM-yyyy") + ".txt";
-            if (!System.IO.File.Exists(tLogFilename))
+            try
             {
-                using (FileStream fs = System.IO.File.Create(tLogFilename))
+                DirectoryInfo logDir = System.IO.Directory.CreateDirectory("LogFiles");
+                string tLogFilename = logDir.FullName + @"\" + "SQLBackupRetention-" + DateTime.Now.ToString("dd-MM-yyyy") + ".txt";
+                if (!System.IO.File.Exists(tLogFilename))
                 {
-                    fs.Close();
+                    using (FileStream fs = System.IO.File.Create(tLogFilename))
+                    {
+                        fs.Close();
+                    }
                 }
+                LogFileName = tLogFilename;
+                LogLine();
+                LogLine("----------------------------------");
+                LogLine("Starting SQLBackupRetention app...");
+                LogLine();
+                return true;
+            } catch (Exception ex) { 
+                if (Config.EmailIsEnabled)
+                {
+                    try
+                    {
+                        if (!Config.IsValidated) Config.CheckEmailConfigIsValid();
+                        SendEmail("ERROR creating log file, will abort. Error message is below."
+                        + Environment.NewLine
+                        + ex.Message
+                        + Environment.NewLine
+                        + ex.StackTrace, true);
+                    } catch { }
+                }
+                return false; 
             }
-            LogFileName = tLogFilename;
-            LogLine();
-            LogLine("----------------------------------");
-            LogLine("Starting SQLBackupRetention app...");
-            LogLine();
         }
         private static void LogException(Exception ex, string message = "")
         {
@@ -404,7 +430,6 @@ namespace SQLBackupRetention
             }
             LogLine();
         }
-
         private static void LogLine(string Line = "")
         {
             try
@@ -418,6 +443,52 @@ namespace SQLBackupRetention
             catch
             {
                 //do nothing, can't log failures to log!
+            }
+        }
+        /// <summary>
+        /// Reads the whole log files and sends it as the body of an email
+        /// </summary>
+        private static void SendLogFileViaEmail()
+        {
+            string msg;
+            if (string.IsNullOrEmpty(LogFileName))
+            {
+                msg = "ERROR locating the app log file. Can't provide App execution details";
+                SendEmail(msg, true);
+                return;
+            }
+            StreamReader rd = new StreamReader(LogFileName);
+            msg = rd.ReadToEnd();
+            SendEmail(msg);
+        }
+        private static void SendEmail(string Content, bool isError = false)
+        {
+            try
+            {
+                MailMessage msg = new MailMessage();
+                msg.To.Add(Config.mailTo);
+                string SMTP = Config.SMTP;
+                string SMTPUser = Config.SMTPUser;
+                string fromCred = Config.SMTPpassword;
+                string mailFrom = Config.mailFrom;
+
+                msg.From = new MailAddress(mailFrom);
+                SmtpClient smtp = new SmtpClient(SMTP);
+                if (isError) msg.Subject = "ERROR in SQL Backup retention app";
+                else msg.Subject = "SQL Backup retention auto Email";
+                //read the log to put in the email message
+                msg.Body = Content;
+
+
+                System.Net.NetworkCredential SMTPUserInfo = new System.Net.NetworkCredential(SMTPUser, fromCred);
+                smtp.UseDefaultCredentials = false;
+                smtp.Credentials = SMTPUserInfo;
+                smtp.EnableSsl = true; smtp.Port = 587;
+                smtp.Send(msg);
+            }
+            catch (Exception ex)
+            {
+                if (!string.IsNullOrEmpty( LogFileName)) LogException(ex, "Could not send summary email");
             }
         }
         //2023_11_22
@@ -459,13 +530,66 @@ namespace SQLBackupRetention
             public bool VerboseLogging { get; set; } = true;
             public bool DoNotUseBlobTimestamps { get; set; } = true;
             public bool AsIf { get; set; } = true;
+            public string EmailMode { get; set; } = "Never";//email isn't enabled until settings are read
+            public string SMTP { get; set; } = "";
+            public string SMTPUser { get; set; } = "";
+            public string mailFrom { get; set; } = "";
+            public string mailTo { get; set; } = "";
+            public string SMTPpassword { get; set; } = "";
 
+            public bool IsValidated { get; private set; } = false;
             public void CheckConfigIsValid()
             {
+                CheckEmailConfigIsValid();
                 if (!StorageURI.StartsWith("https://"))
                     throw new InvalidDataException("StorageURI configuration value is not valid, needs to be present and to start with \"https://\"");
                 else if (SAS == "" || !SAS.StartsWith("sv="))
                     throw new InvalidDataException("SAS configuration value is not valid, it is either absent or invalid.");
+                IsValidated = true;
+            }
+            
+            public void CheckEmailConfigIsValid() 
+            {
+                if (EmailIsEnabled)
+                {
+                    if (SMTP == "" || !SMTP.Contains("."))
+                        throw new InvalidDataException("Email is enabled, but SMTP setting is invalid, needs to be present and be a valid FQDN");
+                    else if (SMTPUser == "")
+                        throw new InvalidDataException("Email is enabled, but SMTPUser setting (used to authenticate when sending emails) is invalid, needs to be present");
+                    else
+                    {
+                        try
+                        {
+                            var emailAddress = new MailAddress(mailFrom);
+                        }
+                        catch
+                        {
+                            throw new InvalidDataException("Email is enabled, but mailFrom setting is invalid, needs to be present and be a valid email address");
+                        }
+                        string[] emails = mailTo.Split(",", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                        foreach (string em in emails)
+                        {
+                            try
+                            {
+                                var emailAddress = new MailAddress(em);
+                            }
+                            catch
+                            {
+                                throw new InvalidDataException("Email is enabled, but mailTo settings are invalid, at least one address needs to be present and be valid");
+                            }
+                        }
+                        if (SMTPpassword == "")
+                            throw new InvalidDataException("Email is enabled, but SMTPUser setting (used to authenticate when sending emails) is invalid, needs to be present");
+                    }
+                }
+            }
+            public bool EmailIsEnabled
+            {
+                get
+                {// Possible values: "OnError", "Always", "Never"
+                    if (EmailMode.ToLower() == "onerror" || EmailMode.ToLower() == "always") return true;
+                    else return false;
+                }
             }
         }
         private class BackedUpDatabases
