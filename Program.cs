@@ -95,7 +95,7 @@ namespace SQLBackupRetention
                 }
                 LogLine("Exiting without errors.");
 
-                if (Config.EmailIsEnabled || (Config.EmailMode.ToLower() == "always" || ContinuedOnError))
+                if (Config.EmailIsEnabled && (Config.EmailMode.ToLower() == "always" || ContinuedOnError))
                 {//if we have instructions for sending emails and either we did get some error (on deleting files) or we're asking to always send emails,
                     //then we send the email!
 
@@ -172,7 +172,7 @@ namespace SQLBackupRetention
             //compute cutoff vals
             KeepAllCutoff = Now.AddDays(-CurrentDatabase.RetainAllInDays);
             WeeksCutoff = KeepAllCutoff.AddDays(CurrentDatabase.WeeksRetention * -7);
-            MonthsCutoff = KeepAllCutoff.AddMonths(-CurrentDatabase.MonthsRetention);
+            MonthsCutoff = WeeksCutoff.AddMonths(-CurrentDatabase.MonthsRetention);
             GlobalCutoff = WeeksCutoff <= MonthsCutoff ? WeeksCutoff : MonthsCutoff;
             if (Config.VerboseLogging)
             {
@@ -208,8 +208,8 @@ namespace SQLBackupRetention
             {
                 MonthsTI.Add(new TimeInterval()
                 {
-                    End = KeepAllCutoff.AddMonths(-i),
-                    Start = KeepAllCutoff.AddMonths(-(i + 1))
+                    End = WeeksCutoff.AddMonths(-i),
+                    Start = WeeksCutoff.AddMonths(-(i + 1))
                 });
             }
             if (Config.VerboseLogging)
@@ -240,11 +240,13 @@ namespace SQLBackupRetention
             foreach(TimeInterval ti in WeeksTI)
             {
                 List<BlobFile> eligible = AllFiles.FindAll(f => f.CreationTime < ti.End && f.CreationTime >= ti.Start);
-                //foreach (BlobFile b in eligible) Console.WriteLine("From " + ti.Start.ToString("dd MMM yyyy")
-                //    + " included, to " + ti.End.ToString("dd MMM yyyy") + " excluded " + b.FileName);
+                
                 if (eligible.Any())
                 {
-                    BlobFile oneToAdd = eligible.Last();//the last eligible is the newest file in the interval
+                    BlobFile oneToAdd = eligible.First();//the First eligible is the oldest file in the interval
+                    //keeping the oldest file in an interval ensures that as times passes, files will flow into the "next = older" interval,
+                    //without being deleted before they get the chance
+                    
                     ti.BlobsToKeep.Add(oneToAdd);
                     eligible.Remove(oneToAdd);
                     if (CurrentDatabase.IsStriped)
@@ -272,11 +274,9 @@ namespace SQLBackupRetention
             foreach (TimeInterval ti in MonthsTI)
             {
                 List<BlobFile> eligible = AllFiles.FindAll(f => f.CreationTime < ti.End && f.CreationTime >= ti.Start);
-                //foreach (BlobFile b in eligible) Console.WriteLine("From " + ti.Start.ToString("dd MMM yyyy")
-                //    + " included, to " + ti.End.ToString("dd MMM yyyy") + " excluded " + b.FileName);
                 if (eligible.Any())
                 {
-                    BlobFile oneToAdd = eligible.Last();//the last eligible is the newest file in the interval
+                    BlobFile oneToAdd = eligible.First();//the First eligible is the oldest file in the interval
                     ti.BlobsToKeep.Add(oneToAdd);
                     eligible.Remove(oneToAdd);
                     if (CurrentDatabase.IsStriped)
@@ -306,8 +306,8 @@ namespace SQLBackupRetention
             {
                 BlobFile file = AllFiles[i];
                 if (!KeepAllFiles.Contains(file)
-                    &&!WeekFilesToKeep.Contains(file)
-                    &&!MonthFilesToKeep.Contains(file)) 
+                    && !WeekFilesToKeep.Contains(file)
+                    && !MonthFilesToKeep.Contains(file)) 
                 {
                     AllFiles.Remove(file);
                     FilesToDelete.Add(file);
